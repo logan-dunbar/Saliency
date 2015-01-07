@@ -5,7 +5,7 @@ function [spArray, motionSignificanceHistory, saliencySpatial] = populateSpArray
 % motion significance window length
 motionSignigicanceWinLength = 5;
 motionSignificanceHistory = [];
-saliencySpatial = zeros(frameNow.imgSize);
+pixelSaliencySpatial = zeros(frameNow.imgSize);
 
 % preallocate spArray
 spArray = repmat(struct( ...
@@ -52,7 +52,7 @@ for i = 1:frameNow.spNum
     % compute center
     [spArray(i).yInds, spArray(i).xInds] = ind2sub(frameNow.imgSize, spArray(i).pixelInds);
     spArray(i).center = [sum(spArray(i).yInds)/length(spArray(i).pixelInds) sum(spArray(i).xInds)/length(spArray(i).pixelInds)];
-    spArray(i).distanceToFrameCenter = pdist2(spArray(i).center, frameNow.center);
+    spArray(i).distanceToFrameCenter = pdist2(spArray(i).center, frameNow.center, 'euclidean');
     
     % compute superpixel level color histogram and normalize
     [spArray(i).colorHist, ~, ~, spArray(i).colorLoc] = histcn(frameNow.labImg(spArray(i).pixelInds,:), frameNow.colorEdges{1}, frameNow.colorEdges{2}, frameNow.colorEdges{3});
@@ -94,79 +94,41 @@ distancesToFrameCenter = [spArray.distanceToFrameCenter]';
 % frameNow.colorHist = 16x16x16 (global histogram counts)
 % spArray(i).colorHist = 16x16x16 (superpixel histogram counts)
 
+% arrange the colorHists from 16x16x16 into a mat of 4096xspNum
+colorHistsMat = cell2mat(cellfun(@(x) x(:), {spArray.colorHist}, 'UniformOutput', false));
 
-distanceMatrix = pdist2(frameNow.colorMean, frameNow.colorMean);
-weightedDistanceMatrix = distanceMatrix * frameNow.colorHist(:);
-tic
-for i = 1:frameNow.spNum
-    % calculate global contrast (slow)
-    %     disp('unvectorized');
-    %     unvectorized = tic;
-    %     spArray(i).saliencyGlobalContrast = 0;
-    %     for j = 1:frameNow.contrastBinCount^3
-    %         innerSum = 0;
-    %         for k = 1:frameNow.contrastBinCount^3
-    %             %innerSum = innerSum + norm(frameNow.colorMean(j,:) - frameNow.colorMean(k,:)) * frameNow.colorHist(k);
-    %             innerSum = innerSum + pdist2(frameNow.colorMean(j,:), frameNow.colorMean(k,:)) * frameNow.colorHist(k);
-    %         end
-    %         spArray(i).saliencyGlobalContrast = spArray(i).saliencyGlobalContrast + (spArray(i).colorHist(j) * innerSum);
-    %     end
-    %     toc(unvectorized);
-    % Elapsed time is 21.300789 seconds.
-    
-    
-    % calculate global contrast
-    % vectorized form of the global contrast saliency calculation. It flattens out the double loop
-    % into large q^3 x q^3 matrices, computes the inner sum for all combinations of j and k,
-    % multiplies each value by the corresponding global contrast bin count at k, sums that value, and
-    % then does the outer j sum and multiply with the superpixel color bin count. Higher memory
-    % requirement but much, much faster. ~20x faster!
-    %     disp('matrices');
-    %     matrices = tic;
-    %     color_l1 = repmat(frameNow.colorMean(:,1), 1, frameNow.contrastBinCount^3);
-    %     color_l2 = repmat(frameNow.colorMean(:,1)', frameNow.contrastBinCount^3, 1);
-    %     color_a1 = repmat(frameNow.colorMean(:,2), 1, frameNow.contrastBinCount^3);
-    %     color_a2 = repmat(frameNow.colorMean(:,2)', frameNow.contrastBinCount^3, 1);
-    %     color_b1 = repmat(frameNow.colorMean(:,3), 1, frameNow.contrastBinCount^3);
-    %     color_b2 = repmat(frameNow.colorMean(:,3)', frameNow.contrastBinCount^3, 1);
-    %
-    %     color_l_diff = color_l1 - color_l2;
-    %     color_a_diff = color_a1 - color_a2;
-    %     color_b_diff = color_b1 - color_b2;
-    %
-    %     color_norm = (color_l_diff.^2 + color_a_diff.^2 + color_b_diff.^2); %no sqrt cuz its not a norm
-    %
-    %     globalColorHist = repmat(frameNow.colorHist(:), 1, frameNow.contrastBinCount^3);
-    %     innerSum = sum(color_norm.*globalColorHist, 1);
-    %     spArray(i).saliencyGlobalContrast = spArray(i).colorHist(:)'*innerSum';
-    %     toc(matrices);
-    % Elapsed time is 1.032221 seconds.
-    
-    spArray(i).saliencyGlobalContrast = spArray(i).colorHist(:)' * weightedDistanceMatrix;
-    
-    % TODO: see if I can't vectorize this better, just worried about memory constraints:
-    % 700x700x4096 * 2 for the first term...
-    %     disp('loop');
-    %     loop = tic;
-    spArray(i).intraFrameSimilarity = zeros(frameNow.spNum, 1);
-    for j = 1:frameNow.spNum
-        spArray(i).intraFrameSimilarity(j) = sum(sqrt(spArray(i).colorHist(:) .* spArray(j).colorHist(:))) * ...
-            (1 - norm(spArray(i).center - spArray(j).center)/frameNow.diagonal);
-    end
-    
-    spArray(i).colorSpatialDistribution = (spArray(i).intraFrameSimilarity'*distancesToFrameCenter)/sum(spArray(i).intraFrameSimilarity);
-    %     toc(loop);
-end
-toc
+% EQ 8
+% compute the static global weighted distances
+colorDistanceMatrix = pdist2(frameNow.colorMean, frameNow.colorMean, 'euclidean');
+weightedColorDistanceMatrix = colorDistanceMatrix * frameNow.colorHist(:);
 
-% calculate saliencySpatialSparcity and saliencySpatial
-maxColorSpatialDistribution = max([spArray.colorSpatialDistribution]);
-minColorSpatialDistribution = min([spArray.colorSpatialDistribution]);
-for i = 1:frameNow.spNum
-    spArray(i).saliencySpatialSparcity = (maxColorSpatialDistribution - spArray(i).colorSpatialDistribution)/(maxColorSpatialDistribution - minColorSpatialDistribution);
-    spArray(i).saliencySpatial = spArray(i).saliencySpatialSparcity * spArray(i).saliencyGlobalContrast;
-end
+% compute the global contrast saliency and assign back into spArray
+saliencyGlobalContrast = colorHistsMat'*weightedColorDistanceMatrix;
 
+% EQ 9
+% compute the bhattacharyya coefficient
+colorHistsSqrt = sqrt(colorHistsMat);
+bhattacharyyaCoeff = colorHistsSqrt'*colorHistsSqrt;
+
+% compute the weights based on distances from centers
+centers = reshape([spArray.center], 2, [])';
+weightedCentersDistanceMatrix = 1 - pdist2(centers, centers, 'euclidean')/frameNow.diagonal;
+
+% EQ 10
+% compute the intra frame similarity and the color spatial distribution
+intraFrameSimilarity = bhattacharyyaCoeff.*weightedCentersDistanceMatrix;
+colorSpatialDistribution = (intraFrameSimilarity*distancesToFrameCenter)./sum(intraFrameSimilarity, 2);
+
+% EQ 11 & 12
+% calculate spatial sparcity saliency and spatial saliency
+maxColorSpatialDistribution = max(colorSpatialDistribution);
+minColorSpatialDistribution = min(colorSpatialDistribution);
+
+saliencySpatialSparcity = (maxColorSpatialDistribution - colorSpatialDistribution)/(maxColorSpatialDistribution - minColorSpatialDistribution);
+saliencySpatial = num2cell(saliencySpatialSparcity.*saliencyGlobalContrast);
+[spArray(:).saliencySpatial] = saliencySpatial{:};
+
+% TODO: check this, feels wrong
 for i = 1:frameNow.spNum
     % find neighbour indices for each superpixel in the current frame
     %spArray(i).nowNeighbouringSpInds = findNeighbouringSuperpixelIndices(i, frameNow, spArray);
@@ -179,7 +141,7 @@ for i = 1:frameNow.spNum
         numeratorSum = numeratorSum + (spArray(j).saliencySpatial * spArray(j).colorHist(colorBinInds));
         denomenatorSum = denomenatorSum + spArray(j).colorHist(colorBinInds);
     end
-    saliencySpatial(spArray(i).pixelInds) = numeratorSum./denomenatorSum;
+    pixelSaliencySpatial(spArray(i).pixelInds) = numeratorSum./denomenatorSum;
 end
 
 
@@ -190,24 +152,17 @@ if frameNow.frameNum ~= 1
     % multiplies each value by the correspoing global motion bin count at k, sums that value, and
     % then does the outer j sum and multiply with the superpixel motion bin count. Higher memory
     % requirement but much, much faster.
-    for i = 1:frameNow.spNum
-        flow_u1 = repmat(frameNow.motionMeanCart(:,1), 1, frameNow.motionBinCount^2);
-        flow_u2 = repmat(frameNow.motionMeanCart(:,1)', frameNow.motionBinCount^2, 1);
-        flow_v1 = repmat(frameNow.motionMeanCart(:,2), 1, frameNow.motionBinCount^2);
-        flow_v2 = repmat(frameNow.motionMeanCart(:,2)', frameNow.motionBinCount^2, 1);
-        
-        flow_u_diff = flow_u1 - flow_u2;
-        flow_v_diff = flow_v1 - flow_v2;
-        
-        flow_norm = sqrt(flow_u_diff.^2 + flow_v_diff.^2);
-        
-        globalMotionHist = repmat(frameNow.motionHist(:), 1, frameNow.motionBinCount^2);
-        innerSum = sum(flow_norm.*globalMotionHist, 1);
-        spArray(i).saliencyMotionDistinctiveness = spArray(i).motionHist(:)'*innerSum';
-    end
+    
+    motionHistsMat = cell2mat(cellfun(@(x) x(:), {spArray.motionHist}, 'UniformOutput', false));
+    
+    flowDistanceMatrix = pdist2(frameNow.motionMeanCart, frameNow.motionMeanCart, 'euclidean');
+    weightedFlowDistanceMatrix = flowDistanceMatrix * frameNow.motionHist(:);
+    
+    saliencyMotionDistinctiveness = motionHistsMat'*weightedFlowDistanceMatrix;
+    
     
     % calculate motion significance
-    motionSignificance = sum([spArray.saliencyMotionDistinctiveness].*[spArray.pixelCount]);
+    motionSignificance = [spArray.pixelCount] * saliencyMotionDistinctiveness;
     if frameNow.frameNum == 2
         motionSignificanceHistory = motionSignificance;
     else
@@ -218,10 +173,34 @@ if frameNow.frameNum ~= 1
     end
     
     % TODO: double loop, see if I can't collapse it/vectorize it
+    
+    
+    
+    if frameNow.frameNum == 2
+        salMotionDistCell = num2cell(saliencyMotionDistinctiveness);
+        [spArray(:).saliencyTemporal] = salMotionDistCell{:};
+    else
+        prevMatchingSpInds = [spArray.prevMatchingSpInd];
+        prevNeighbouringSpInds1 = {framePrev.spArray(prevMatchingSpInds).neighbourSpInds};
+        interFrameSimilarity = {spArray.interFrameSimilarity};
+
+
+
+
+        saliencyTemporalPrediction = cellfun(@(inds, interFrameSim) ([framePrev.spArray(inds).saliencyTemporal]*interFrameSim)/sum(interFrameSim), prevNeighbouringSpInds1, interFrameSimilarity, 'UniformOutput', false);
+        emptyInds = cellfun('isempty', saliencyTemporalPrediction);
+        saliencyTemporalPrediction{emptyInds} = {0};
+        saliencyTemporalPrediction = cell2mat(saliencyTemporalPrediction);
+        
+        saliencyTemporal
+        
+    end
+    
+    
     for i = 1:frameNow.spNum
         if frameNow.frameNum == 2
             % no previous saliency value on first motion frame, just use motion distinctiveness
-            spArray(i).saliencyTemporal = spArray(i).saliencyMotionDistinctiveness;
+            spArray(i).saliencyTemporal = saliencyMotionDistinctiveness(i);
         else
             if sum(spArray(i).interFrameSimilarity) > 0
                 % calculate temporal saliency prediction
@@ -231,14 +210,13 @@ if frameNow.frameNum ~= 1
                 
                 % calculate temporal saliency by adjustment
                 spArray(i).saliencyTemporal = adjustmentWeight*spArray(i).saliencyTemporalPrediction + ...
-                    (1 - adjustmentWeight)*spArray(i).saliencyMotionDistinctiveness;
+                    (1 - adjustmentWeight)*saliencyMotionDistinctiveness(i);
             else
                 spArray(i).saliencyTemporalPrediction = 0;
-                spArray(i).saliencyTemporal = spArray(i).saliencyMotionDistinctiveness;
+                spArray(i).saliencyTemporal = saliencyMotionDistinctiveness(i);
             end
         end
     end
 end
 
 end
-
